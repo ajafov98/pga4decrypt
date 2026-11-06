@@ -1,63 +1,169 @@
 #!/usr/bin/python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "cryptography>=43",
+#     "keyring>=24",
+# ]
+# ///
 
 import argparse
-import json
 import sqlite3
+import sys
 
 from lib.cli import bold
 from lib.cli import bright_red
 from lib.cli import bright_green
 from lib.cli import validate_path
 
-from lib import scanner
+from lib import docker
+from lib import interactive
+from lib import session
 
-def export(servers, format, path):
-    with open(path, 'w') as f:
-        if format == 'text':
-            for server in servers:
-                print('Name: ' + server['name'], file = f)
-                print('Host: ' + server['host'], file = f)
-                print('Port: ' + str(server['port']), file = f)
-                print('Username: ' + server['username'], file = f)
-                print('Password: ' + server['password'], file = f)
-                print('-----------------------------------', file = f)
-        else:
-            f.write(json.dumps(servers))
 
 def main():
     parser = argparse.ArgumentParser(
-        description = 'A tool for recovering server credentials from a pgadmin4 database'
-    )
+        description='Recover server credentials from a pgAdmin 4 database')
 
-    parser.add_argument('path', action='store', help='Path to the database (typically named pgadmin4.db)')
-    parser.add_argument('-f', action='store', choices=['text', 'json'], help='The output format for the -o option (default: text)', default='text')
-    parser.add_argument('-o', metavar='PATH', action='store', help='Path to a file to save the credentials in')
+    parser.add_argument('path', nargs='?',
+                        help='Path to pgadmin4.db (auto-detected if omitted)')
+    parser.add_argument('--db', metavar='PATH',
+                        help='Path to pgadmin4.db (same as the positional arg)')
+    parser.add_argument('--key', help='Encryption key (master key / keyring)')
+    parser.add_argument('--key-file', metavar='PATH',
+                        help='Read the encryption key from a file')
+    parser.add_argument('--master-password', action='store_true',
+                        help='Prompt for the pgAdmin master password')
+    parser.add_argument('--login-password', action='store_true',
+                        help='Prompt for the pgAdmin login password '
+                             '(server mode)')
+    parser.add_argument('--inspect', action='store_true',
+                        help='Show database metadata (users, servers, saved '
+                             'passwords, storage format) and exit')
+    parser.add_argument('--docker', metavar='CONTAINER',
+                        help='Copy pgadmin4.db from a Docker container')
+    parser.add_argument('--compose-service', metavar='SERVICE',
+                        help='Copy pgadmin4.db from a Docker Compose service')
+    parser.add_argument('--compose-project', metavar='PROJECT',
+                        help='Disambiguate --compose-service when the service '
+                             'name exists in several compose projects')
+    parser.add_argument('--compose-file', metavar='PATH',
+                        help='Optional docker-compose.yml for '
+                             '--compose-service')
+    parser.add_argument('--docker-path', metavar='PATH',
+                        default=docker.DEFAULT_REMOTE_DB,
+                        help='Database path inside the container '
+                             '(default: %(default)s)')
+    parser.add_argument('-i', '--interactive', action='store_true',
+                        help='Interactive wizard (menus and prompts)')
+    parser.add_argument('-f', action='store', choices=['text', 'json'],
+                        help='The output format for the -o option '
+                             '(default: text)', default='text')
+    parser.add_argument('-o', metavar='PATH', action='store',
+                        help='Path to a file to save the credentials in')
     args = parser.parse_args()
 
-    if not validate_path(args.path):
-        exit(1)
+    if args.interactive:
+        sys.exit(interactive.run())
 
-    db = sqlite3.connect(args.path)
-    servers = scanner.read_and_decrypt_servers(db)
+    explicit = args.db or args.path
+    docker_source = args.docker or args.compose_service
+
+    if args.docker and args.compose_service:
+        print(bright_red('Error: use either --docker or --compose-service, '
+                         'not both'), file=sys.stderr)
+        sys.exit(1)
+    if args.compose_file and not args.compose_service:
+        print(bright_red('Error: --compose-file requires '
+                         '--compose-service'), file=sys.stderr)
+        sys.exit(1)
+    if args.compose_project and not args.compose_service:
+        print(bright_red('Error: --compose-project requires '
+                         '--compose-service'), file=sys.stderr)
+        sys.exit(1)
+    if docker_source and explicit:
+        print(bright_red('Error: choose either a local database or a Docker '
+                         'source'), file=sys.stderr)
+        sys.exit(1)
+
+    if docker_source:
+        try:
+            path = docker.copy_database(
+                container=args.docker,
+                compose_service=args.compose_service,
+                compose_project=args.compose_project,
+                compose_file=args.compose_file,
+                remote_path=args.docker_path,
+            )
+        except docker.DockerError as exc:
+            print(bright_red('Docker error: {0}'.format(exc)),
+                  file=sys.stderr)
+            sys.exit(1)
+        print('Copied ' + docker.describe(
+            container=args.docker,
+            compose_service=args.compose_service,
+            remote_path=args.docker_path) + ' to ' + path, file=sys.stderr)
+    else:
+        path = session.find_database(explicit)
+
+    if path is None:
+        sys.exit(1)
+
+    if not validate_path(str(path)):
+        sys.exit(1)
+
+    try:
+        db = session.open_database(path)
+        db.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone()
+    except sqlite3.DatabaseError as exc:
+        print(bright_red('Error: not a readable pgAdmin SQLite database: '
+                         '{0}'.format(exc)), file=sys.stderr)
+        sys.exit(1)
+
+    print('Database: ' + str(path), file=sys.stderr)
+
+    if args.inspect:
+        session.print_diagnostics(db, stream=sys.stdout)
+        sys.exit(0)
+
+    key, source, servers = session.resolve_key(
+        db,
+        key=args.key,
+        key_file=args.key_file,
+        master_password=args.master_password,
+        login_password=args.login_password,
+    )
+    if source:
+        print('Key source: ' + source, file=sys.stderr)
 
     if len(servers) == 0:
         print(bright_red('Failed: could not decrypt any server credentials'))
-        exit(0)
+        session.print_diagnostics(db)
+        print('Things to check:', file=sys.stderr)
+        print('  - "0 with saved passwords": enable "Save password" in the '
+              'server properties', file=sys.stderr)
+        print('  - "Master password check set: yes": try --master-password',
+              file=sys.stderr)
+        print('  - otherwise verify that the password logs you into the '
+              'pgAdmin web UI (PGADMIN_DEFAULT_PASSWORD only applies when '
+              'the database is first created)', file=sys.stderr)
+        sys.exit(1)
 
-    print('\nDecrypted {c} sets of credentials\n'.format(c = len(servers)))
+    print('\nDecrypted {c} sets of credentials\n'.format(c=len(servers)))
 
     for server in servers:
-        print(bold('Name: ') + server['name'])
-        print(bold('Host: ') + server['host'])
+        print(bold('Name: ') + str(server['name']))
+        print(bold('Host: ') + str(server['host']))
         print(bold('Port: ') + str(server['port']))
-        print(bold('Username: ') + server['username'])
+        print(bold('Username: ') + str(server['username']))
         print(bold('Password: ') + bright_green(server['password']))
         print('-----------------------------------')
 
     print('')
 
-    if not args.o is None:
-        export(servers, args.f, args.o)
+    if args.o is not None:
+        session.export(servers, args.f, args.o)
 
-if __name__  == '__main__':
+
+if __name__ == '__main__':
     main()

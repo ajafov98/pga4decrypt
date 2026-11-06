@@ -2,62 +2,95 @@
 #
 # pgAdmin 4 - PostgreSQL Tools
 #
-# Copyright (C) 2013 - 2019, The pgAdmin Development Team
+# Copyright (C) 2013 - 2026, The pgAdmin Development Team
 # This software is released under the PostgreSQL Licence
 #
-#########################################################################
+##########################################################################
 
-"""This File Provides Cryptography."""
+"""This File Provides Cryptography.
 
-from __future__ import division
+The on-disk format changed over pgAdmin releases:
+
+  legacy  (<= 6.x):  base64(iv + ciphertext)
+  modern  (>= 7.0):  hex(base64(iv + ciphertext))
+
+Both are accepted here.
+"""
 
 import base64
-import hashlib
-import os
-
-import six
+import re
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
-from cryptography.hazmat.primitives.ciphers.modes import CFB8
+
+try:  # cryptography >= 43
+    from cryptography.hazmat.decrepit.ciphers.modes import CFB8
+except ImportError:  # pragma: no cover - older cryptography
+    from cryptography.hazmat.primitives.ciphers.modes import CFB8
 
 padding_string = b'}'
 iv_size = AES.block_size // 8
 
+MASTERPASS_CHECK_TEXT = 'ideas are bulletproof'
+
+_BASE64_RE = re.compile(rb'^[A-Za-z0-9+/]*={0,2}$')
+
 
 def encrypt(plaintext, key):
-    """
-    Encrypt the plaintext with AES method.
-
-    Parameters:
-        plaintext -- String to be encrypted.
-        key       -- Key for encryption.
-    """
+    """Encrypt plaintext with AES-CFB8 (same scheme as pgAdmin)."""
+    import os
 
     iv = os.urandom(iv_size)
     cipher = Cipher(AES(pad(key)), CFB8(iv), default_backend())
     encryptor = cipher.encryptor()
 
-    # If user has entered non ascii password (Python2)
-    # we have to encode it first
-    if isinstance(plaintext, six.text_type):
+    if isinstance(plaintext, str):
         plaintext = plaintext.encode()
 
     return base64.b64encode(iv + encryptor.update(plaintext) +
                             encryptor.finalize())
 
 
+def _looks_like_base64(data):
+    return bool(data) and len(data) % 4 == 0 and _BASE64_RE.match(data)
+
+
+def decode_ciphertext(value):
+    """Undo pgAdmin's storage encoding and return raw IV + ciphertext."""
+    if isinstance(value, str):
+        raw = value.encode('ascii')
+    else:
+        raw = bytes(value)
+
+    # Modern format: hex of the base64 text.
+    try:
+        unhexed = bytes.fromhex(raw.decode('ascii'))
+    except (ValueError, UnicodeDecodeError):
+        unhexed = None
+
+    if unhexed is not None and _looks_like_base64(unhexed):
+        raw = unhexed
+
+    return base64.b64decode(raw, validate=False)
+
+
+def storage_format(value):
+    """Return 'hex' or 'base64' for a value read from the config DB."""
+    if isinstance(value, str):
+        raw = value.encode('ascii')
+    else:
+        raw = bytes(value)
+    try:
+        unhexed = bytes.fromhex(raw.decode('ascii'))
+    except (ValueError, UnicodeDecodeError):
+        return 'base64'
+    return 'hex' if _looks_like_base64(unhexed) else 'base64'
+
+
 def decrypt(ciphertext, key):
-    """
-    Decrypt the AES encrypted string.
-
-    Parameters:
-        ciphertext -- Encrypted string with AES method.
-        key        -- key to decrypt the encrypted string.
-    """
-
-    ciphertext = base64.b64decode(ciphertext)
+    """Decrypt an AES encrypted string."""
+    ciphertext = decode_ciphertext(ciphertext)
     iv = ciphertext[:iv_size]
 
     cipher = Cipher(AES(pad(key)), CFB8(iv), default_backend())
@@ -68,57 +101,23 @@ def decrypt(ciphertext, key):
 def pad(key):
     """Add padding to the key."""
 
-    if isinstance(key, six.text_type):
+    if isinstance(key, str):
         key = key.encode()
 
-    # Key must be maximum 32 bytes long, so take first 32 bytes
     key = key[:32]
 
-    # If key size is 16, 24 or 32 bytes then padding is not required
     if len(key) in (16, 24, 32):
         return key
 
-    # Add padding to make key 32 bytes long
     return key.ljust(32, padding_string)
 
 
-def pqencryptpassword(password, user):
-    """
-    pqencryptpassword -- to encrypt a password
-    This is intended to be used by client applications that wish to send
-    commands like ALTER USER joe PASSWORD 'pwd'.  The password need not
-    be sent in cleartext if it is encrypted on the client side.  This is
-    good because it ensures the cleartext password won't end up in logs,
-    pg_stat displays, etc. We export the function so that clients won't
-    be dependent on low-level details like whether the enceyption is MD5
-    or something else.
-
-    Arguments are the cleartext password, and the SQL name of the user it
-    is for.
-
-    Return value is "md5" followed by a 32-hex-digit MD5 checksum..
-
-    Args:
-      password:
-      user:
-
-    Returns:
-
-    """
-
-    m = hashlib.md5()
-
-    # Place salt at the end because it may be known by users trying to crack
-    # the MD5 output.
-    # Handling of non-ascii password (Python2)
-    if hasattr(str, 'decode'):
-        password = password.encode('utf-8')
-        user = user.encode('utf-8')
-    else:
-        password = password.encode()
-        user = user.encode()
-
-    m.update(password)
-    m.update(user)
-
-    return "md5" + m.hexdigest()
+def validate_key(key, masterpass_check):
+    """Return True if key decrypts pgAdmin's master-password check text."""
+    if key is None or masterpass_check is None:
+        return False
+    try:
+        return decrypt(masterpass_check, key).decode('utf-8') == \
+            MASTERPASS_CHECK_TEXT
+    except Exception:
+        return False
